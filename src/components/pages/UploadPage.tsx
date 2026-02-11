@@ -1,0 +1,650 @@
+import { useState } from 'react';
+import { BaseCrudService } from '@/integrations';
+import { ProjectReports } from '@/entities';
+import { Upload, FileText, CheckCircle, AlertCircle, Loader } from 'lucide-react';
+import { motion } from 'framer-motion';
+import { format } from 'date-fns';
+import { saveOrUpdateProject } from '@/lib/project-service';
+import Header from '@/components/Header';
+import Footer from '@/components/Footer';
+
+// API base (use Vite env in dev, fallback to local backend)
+const API_BASE = (import.meta as any)?.env?.VITE_API_BASE || 'http://127.0.0.1:5002';
+interface AnalysisResult {
+  projectId?: string;
+  project_info: {
+    full_name: string;
+    code: string;
+    customer?: string;
+    report_period: string;
+    location?: string;
+  };
+  project_status: 'нормальный' | 'тревожный' | 'критичный';
+  metrics: {
+    SMR_completion?: number;
+    GPR_delay_percent?: number;
+    GPR_delay_days?: number;
+    DDU_payments_percent?: number[];
+    guarantee_extension?: boolean;
+  };
+  reasoning: string[];
+  triggered_conditions: string[];
+}
+
+export default function UploadPage() {
+  const [selectedFile, setSelectedFile] = useState<File | null>(null);
+  const [uploadStatus, setUploadStatus] = useState<'idle' | 'uploading' | 'success' | 'error'>('idle');
+  const [analysisResult, setAnalysisResult] = useState<AnalysisResult | null>(null);
+  const [recentReports, setRecentReports] = useState<ProjectReports[]>([]);
+  const [dragActive, setDragActive] = useState(false);
+  const [errorMessage, setErrorMessage] = useState('');
+  const [needs3ReportsFlag, setNeeds3ReportsFlag] = useState(false);
+  const [manualProjectName, setManualProjectName] = useState('');
+  const [projectSaved, setProjectSaved] = useState(false);
+  const [savingProject, setSavingProject] = useState(false);
+  const [uploadedFileName, setUploadedFileName] = useState<string>('');
+
+  // Сохранить проект с обновленным названием (после ручного ввода)
+  const handleSaveProject = async () => {
+    if (!analysisResult) return;
+
+    setSavingProject(true);
+    try {
+      const projectSaveResult = await saveOrUpdateProject(analysisResult, {
+        fileName: uploadedFileName || 'untitled.pdf',
+        uploadedAt: new Date().toISOString(),
+        projectName: analysisResult.project_info.full_name,
+      });
+      console.log('✓ Project saved with name:', analysisResult.project_info.full_name);
+      console.log('Project saved/updated:', projectSaveResult);
+      setProjectSaved(true);
+    } catch (err) {
+      console.error('Failed to save project:', err);
+      setErrorMessage('Ошибка при сохранении проекта');
+    } finally {
+      setSavingProject(false);
+    }
+  };
+
+  const handleDrag = (e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    if (e.type === 'dragenter' || e.type === 'dragover') {
+      setDragActive(true);
+    } else if (e.type === 'dragleave') {
+      setDragActive(false);
+    }
+  };
+
+  const handleDrop = (e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setDragActive(false);
+
+    const files = e.dataTransfer.files;
+    if (files && files[0]) {
+      const file = files[0];
+      if (file.type === 'application/pdf') {
+        setSelectedFile(file);
+        setErrorMessage('');
+      } else {
+        setErrorMessage('Пожалуйста, загрузите PDF файл');
+      }
+    }
+  };
+
+  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (e.target.files && e.target.files[0]) {
+      const file = e.target.files[0];
+      if (file.type === 'application/pdf') {
+        setSelectedFile(file);
+        setErrorMessage('');
+      } else {
+        setErrorMessage('Пожалуйста, выберите PDF файл');
+      }
+    }
+  };
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+
+    if (!selectedFile) {
+      setErrorMessage('Пожалуйста, выберите файл для анализа');
+      return;
+    }
+
+    setUploadStatus('uploading');
+    setErrorMessage('');
+
+    try {
+      const formData = new FormData();
+      formData.append('file', selectedFile);
+
+      console.log('Sending request to:', `${API_BASE}/api/analyze-report`);
+
+      // Отправляем на backend для анализа с timeout 45 секунд
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 45000);
+
+      const response = await fetch(`${API_BASE}/api/analyze-report`, {
+        method: 'POST',
+        body: formData,
+        signal: controller.signal,
+      }).catch(err => {
+        clearTimeout(timeoutId);
+        if (err.name === 'AbortError') {
+          throw new Error('Анализ файла занял слишком долго. Попробуйте позже или проверьте размер файла.');
+        }
+        throw err;
+      });
+
+      clearTimeout(timeoutId);
+      console.log('Response status:', response.status, response.statusText);
+
+      if (!response.ok && response.status !== 200) {
+        const text = await response.text().catch(() => 'Unknown error');
+        console.error('API returned non-OK:', response.status, response.statusText, text);
+        
+        try {
+          const errorData = JSON.parse(text);
+          throw new Error(errorData.error || `API error: ${response.status}`);
+        } catch (e) {
+          throw new Error(`API error: ${response.status}`);
+        }
+      }
+
+      // Читаем тело и логируем для отладки (защитное парсирование)
+      const respText = await response.text();
+      let result;
+      try {
+        result = JSON.parse(respText);
+        console.debug('Analyzer response:', result);
+        console.log('ProjectId from backend:', result?.projectId);
+        console.log('Code from backend:', result?.project_info?.code);
+        setAnalysisResult(result);
+        // Если требуется ручной ввод названия, сбрасываем поле
+        if (result && result.require_manual_name) {
+          setManualProjectName('');
+        }
+      } catch (parseErr) {
+        console.error('Failed to parse analyzer response as JSON:', parseErr, respText);
+        throw new Error('Invalid JSON response from analyzer');
+      }
+
+      // НЕ сохраняем проект сразу! Дождемся пока пользователь введёт название
+      setProjectSaved(false);
+      // Сохраняем имя файла для дальнейшего использования
+      setUploadedFileName(selectedFile.name);
+
+      // Если НЕ требуется ручной ввод названия, сохраняем проект сразу
+      if (!result.require_manual_name) {
+        try {
+          console.log('Auto-saving project (no manual name required)...');
+          await saveOrUpdateProject(result, {
+            fileName: selectedFile.name,
+            uploadedAt: new Date().toISOString(),
+            projectName: result.project_info.full_name,
+          });
+          console.log('✓ Project auto-saved');
+          setProjectSaved(true);
+        } catch (autoSaveErr) {
+          console.error('Failed to auto-save project:', autoSaveErr);
+          // Продолжаем - отчёт всё равно сохранится
+        }
+      }
+
+      // Сохраняем отчет в базу данных
+      // Надёжный id: fallback если crypto.randomUUID недоступен в среде
+      const reportId = (typeof crypto !== 'undefined' && (crypto as any).randomUUID)
+        ? (crypto as any).randomUUID()
+        : `id-${Date.now()}-${Math.floor(Math.random() * 1e6)}`;
+
+      const newReport: ProjectReports = {
+        _id: reportId,
+        reportFileName: selectedFile.name,
+        uploadDate: new Date().toISOString(),
+        processingStatus: 'Completed',
+        ingestionLog: `Анализ завершен: Статус проекта - ${result.project_status}. ${result.project_info.full_name}`,
+        analysisResult: result,  // Сохраняем полный результат анализа
+      };
+
+      try {
+        await BaseCrudService.create('projectreports', newReport);
+        console.log('Project report saved successfully:', reportId);
+      } catch (dbErr) {
+        console.error('Failed to save project report to DB:', dbErr);
+        console.warn('Continuing despite DB error - analysis result already displayed');
+        // Не прерываем выполнение - отображаем результат даже если сохранение не прошло
+      }
+
+      setUploadStatus('success');
+      setSelectedFile(null);
+
+      // If analyzer returned needs3Reports, surface a prominent UI hint
+      if (result?.needs3Reports) {
+        setNeeds3ReportsFlag(true);
+      } else {
+        setNeeds3ReportsFlag(false);
+      }
+
+      // Load recent reports - не прерываем даже если это не удается
+      try {
+        const resultReports = await BaseCrudService.getAll<ProjectReports>('projectreports', [], { limit: 5 });
+        const sorted = resultReports.items.sort((a, b) => {
+          const dateA = a.uploadDate ? new Date(a.uploadDate).getTime() : 0;
+          const dateB = b.uploadDate ? new Date(b.uploadDate).getTime() : 0;
+          return dateB - dateA;
+        });
+        setRecentReports(sorted);
+      } catch (reportsErr) {
+        console.error('Failed to load recent reports:', reportsErr);
+      }
+
+      setTimeout(() => setUploadStatus('idle'), 5000);
+    } catch (error) {
+      console.error('Error analyzing report:', error);
+      setUploadStatus('error');
+      const errorMsg = error instanceof Error ? error.message : 'Неизвестная ошибка';
+      setErrorMessage(`Ошибка при анализе отчета: ${errorMsg}`);
+      setTimeout(() => setUploadStatus('idle'), 3000);
+    }
+  };
+
+  const getStatusIcon = (status: string) => {
+    const icons: Record<string, React.ReactNode> = {
+      'нормальный': '🟢',
+      'тревожный': '🟡',
+      'критичный': '🔴'
+    };
+    return icons[status] || '❓';
+  };
+
+  return (
+    <div className="min-h-screen bg-background">
+      <Header />
+
+      <main className="w-full">
+        <section className="w-full max-w-[100rem] mx-auto px-8 lg:px-16 pt-16 pb-12">
+          <motion.div
+            initial={{ opacity: 0, y: 20 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ duration: 0.6 }}
+          >
+            <h1 className="font-heading text-5xl text-deep-black mb-4">
+              Загрузить Отчёты Проектов
+            </h1>
+            <p className="font-paragraph text-lg text-medium-grey">
+              Отправляйте PDF-отчёты для автоматического анализа текста и оценки статуса проекта
+            </p>
+          </motion.div>
+        </section>
+
+        <section className="w-full max-w-[100rem] mx-auto px-8 lg:px-16 pb-20">
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-12">
+            {/* Upload Form */}
+            <motion.div
+              initial={{ opacity: 0, x: -20 }}
+              animate={{ opacity: 1, x: 0 }}
+              transition={{ duration: 0.6, delay: 0.2 }}
+            >
+              <div className="bg-white p-10 rounded-lg border border-light-grey">
+                <div className="flex items-center gap-3 mb-8">
+                  <Upload className="w-6 h-6 text-primary" />
+                  <h2 className="font-heading text-3xl text-deep-black">
+                    Анализ Отчёта
+                  </h2>
+                </div>
+
+                <form onSubmit={handleSubmit} className="space-y-6">
+                  {/* Drag and Drop Area */}
+                  <div
+                    onDragEnter={handleDrag}
+                    onDragLeave={handleDrag}
+                    onDragOver={handleDrag}
+                    onDrop={handleDrop}
+                    className={`border-2 border-dashed rounded-lg p-8 text-center transition-colors ${
+                      dragActive
+                        ? 'border-primary bg-primary/5'
+                        : 'border-light-grey hover:border-primary'
+                    }`}
+                  >
+                    <Upload className="w-12 h-12 text-medium-grey mx-auto mb-4" />
+                    <p className="font-paragraph text-base text-foreground mb-2">
+                      Перетащите ваш PDF отчет сюда
+                    </p>
+                    <p className="font-paragraph text-sm text-medium-grey mb-4">
+                      или щелкните для выбора файла
+                    </p>
+                    <label className="cursor-pointer">
+                      <input
+                        type="file"
+                        accept=".pdf"
+                        onChange={handleFileChange}
+                        className="hidden"
+                      />
+                      <span className="inline-block px-8 py-3 border border-primary text-primary font-paragraph text-base rounded-md hover:text-accent-gold hover:border-accent-gold transition-colors">
+                        Choose File
+                      </span>
+                    </label>
+                  </div>
+
+                  {/* Selected File Display */}
+                  {selectedFile && (
+                    <div className="p-4 bg-background rounded-lg border border-light-grey">
+                      <p className="font-paragraph text-sm text-foreground font-medium">
+                        Выбранный файл:
+                      </p>
+                      <p className="font-paragraph text-base text-deep-black">
+                        {selectedFile.name}
+                      </p>
+                      <p className="font-paragraph text-xs text-medium-grey mt-2">
+                        {(selectedFile.size / 1024 / 1024).toFixed(2)} МБ
+                      </p>
+                    </div>
+                  )}
+
+                  {/* Error Message */}
+                  {errorMessage && (
+                    <motion.div
+                      initial={{ opacity: 0, y: -10 }}
+                      animate={{ opacity: 1, y: 0 }}
+                      className="flex items-center gap-3 p-4 bg-warning-red/10 rounded-lg border border-warning-red"
+                    >
+                      <AlertCircle className="w-5 h-5 text-warning-red flex-shrink-0" />
+                      <p className="font-paragraph text-sm text-warning-red">
+                        {errorMessage}
+                      </p>
+                    </motion.div>
+                  )}
+
+                  {/* Submit Button */}
+                  <div className="pt-4">
+                    <button
+                      type="submit"
+                      disabled={!selectedFile || uploadStatus === 'uploading'}
+                      className="w-full px-8 py-4 border border-primary text-primary font-paragraph text-base rounded-md hover:text-accent-gold hover:border-accent-gold transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2"
+                    >
+                      {uploadStatus === 'uploading' && (
+                        <Loader className="w-5 h-5 animate-spin" />
+                      )}
+                      {uploadStatus === 'uploading' ? 'Анализирование...' : 'Анализировать Отчёт'}
+                    </button>
+                  </div>
+
+                  {uploadStatus === 'success' && (
+                    <motion.div
+                      initial={{ opacity: 0, y: -10 }}
+                      animate={{ opacity: 1, y: 0 }}
+                      className="flex items-center gap-3 p-4 bg-success-green/10 rounded-lg border border-success-green"
+                    >
+                      <CheckCircle className="w-5 h-5 text-success-green flex-shrink-0" />
+                      <p className="font-paragraph text-sm text-success-green">
+                        Отчёт успешно проанализирован!
+                      </p>
+                    </motion.div>
+                  )}
+
+                  {uploadStatus === 'error' && !errorMessage && (
+                    <motion.div
+                      initial={{ opacity: 0, y: -10 }}
+                      animate={{ opacity: 1, y: 0 }}
+                      className="flex items-center gap-3 p-4 bg-warning-red/10 rounded-lg border border-warning-red"
+                    >
+                      <AlertCircle className="w-5 h-5 text-warning-red flex-shrink-0" />
+                      <p className="font-paragraph text-sm text-warning-red">
+                        Ошибка при анализе отчёта. Попытайтесь ещё раз.
+                      </p>
+                    </motion.div>
+                  )}
+                </form>
+              </div>
+
+              {/* Instructions */}
+              <div className="bg-background p-8 rounded-lg mt-8">
+                <h3 className="font-heading text-xl text-deep-black mb-4">
+                  Рекомендации по Загрузке
+                </h3>
+                <ul className="space-y-3">
+                  <li className="flex items-start gap-3">
+                    <span className="font-paragraph text-base text-accent-gold mt-1">•</span>
+                    <p className="font-paragraph text-base text-foreground">
+                      Отчёты должны быть в формате PDF
+                    </p>
+                  </li>
+                  <li className="flex items-start gap-3">
+                    <span className="font-paragraph text-base text-accent-gold mt-1">•</span>
+                    <p className="font-paragraph text-base text-foreground">
+                      Анализатор извлекает информацию о проекте и метрики из текста
+                    </p>
+                  </li>
+                  <li className="flex items-start gap-3">
+                    <span className="font-paragraph text-base text-accent-gold mt-1">•</span>
+                    <p className="font-paragraph text-base text-foreground">
+                      Текстовый анализ определяет статус проекта (нормальный, тревожный, критичный)
+                    </p>
+                  </li>
+                  <li className="flex items-start gap-3">
+                    <span className="font-paragraph text-base text-accent-gold mt-1">•</span>
+                    <p className="font-paragraph text-base text-foreground">
+                      Извлекаемые метрики: завершение СМР, задержка ГПР, платежи по ДДУ, гарантии
+                    </p>
+                  </li>
+                </ul>
+              </div>
+            </motion.div>
+
+            {/* Analysis Results / Recent Reports */}
+            <motion.div
+              initial={{ opacity: 0, x: 20 }}
+              animate={{ opacity: 1, x: 0 }}
+              transition={{ duration: 0.6, delay: 0.3 }}
+            >
+              {analysisResult ? (
+                <div className="bg-white p-10 rounded-lg border border-light-grey">
+                  {needs3ReportsFlag && (
+                    <div className="mb-4 p-4 bg-yellow-50 border-l-4 border-yellow-400 rounded">
+                      <strong>Недостаточно данных:</strong> Для оценки пункта B6 требуется загрузить отчёты за последние 3 месяца. Пока оценка B6 отложена.
+                    </div>
+                  )}
+                  <div className="flex items-center gap-3 mb-8">
+                    <FileText className="w-6 h-6 text-primary" />
+                    <h2 className="font-heading text-3xl text-deep-black">
+                      Результаты Анализа
+                    </h2>
+                  </div>
+
+                  <div className="space-y-6">
+                    {/* Project Info */}
+                    <div className="border-b border-light-grey pb-6">
+                      <h3 className="font-heading text-lg text-deep-black mb-3">Информация о Проекте</h3>
+                      <div className="space-y-2">
+                        <div>
+                          <p className="font-paragraph text-xs text-medium-grey uppercase tracking-wide">Наименование</p>
+                          {analysisResult.require_manual_name ? (
+                            <div className="flex gap-2 items-end">
+                              <div className="flex-1">
+                                <input
+                                  type="text"
+                                  className="font-paragraph text-base text-foreground border border-light-grey rounded px-2 py-1 w-full"
+                                  placeholder="Введите название проекта"
+                                  value={manualProjectName}
+                                  onChange={e => {
+                                    setManualProjectName(e.target.value);
+                                    // Обновляем analysisResult.project_info.full_name на лету
+                                    setAnalysisResult(prev => prev ? {
+                                      ...prev,
+                                      project_info: {
+                                        ...prev.project_info,
+                                        full_name: e.target.value
+                                      }
+                                    } : prev);
+                                  }}
+                                />
+                              </div>
+                              <button
+                                onClick={handleSaveProject}
+                                disabled={savingProject}
+                                className="px-4 py-2 bg-primary text-white rounded hover:bg-primary-dark transition-colors text-sm font-semibold disabled:opacity-50 disabled:cursor-not-allowed"
+                              >
+                                {savingProject ? '⏳ Сохранение...' : '✓ Сохранить'}
+                              </button>
+                            </div>
+                          ) : (
+                            <p className="font-paragraph text-base text-foreground">
+                              {analysisResult.project_info.full_name}
+                            </p>
+                          )}
+                        </div>
+                        <div>
+                          <p className="font-paragraph text-xs text-medium-grey uppercase tracking-wide">Код</p>
+                          <p className="font-paragraph text-base text-foreground">
+                            {analysisResult.project_info.code}
+                          </p>
+                        </div>
+                        <div>
+                          <p className="font-paragraph text-xs text-medium-grey uppercase tracking-wide">Период</p>
+                          <p className="font-paragraph text-base text-foreground">
+                            {analysisResult.project_info.report_period}
+                          </p>
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Project Status */}
+                    <div className="border-b border-light-grey pb-6">
+                      <h3 className="font-heading text-lg text-deep-black mb-3">Статус Проекта</h3>
+                      <div className="p-4 bg-background rounded-lg text-center">
+                        <p className="font-heading text-4xl mb-2">
+                          {getStatusIcon(analysisResult.project_status)}
+                        </p>
+                        <p className="font-heading text-2xl text-deep-black capitalize mb-2">
+                          {analysisResult.project_status}
+                        </p>
+                      </div>
+                    </div>
+
+                    {/* Key Metrics */}
+                    {(analysisResult.metrics.SMR_completion !== undefined ||
+                      analysisResult.metrics.GPR_delay_percent !== undefined ||
+                      analysisResult.metrics.DDU_payments_percent) && (
+                      <div className="border-b border-light-grey pb-6">
+                        <h3 className="font-heading text-lg text-deep-black mb-3">Ключевые Метрики</h3>
+                        <div className="space-y-2">
+                          {typeof analysisResult.metrics.SMR_completion === 'number' && (
+                            <div className="flex justify-between">
+                              <span className="font-paragraph text-sm text-foreground">Завершение СМР</span>
+                              <span className="font-paragraph text-sm font-medium text-deep-black">
+                                {analysisResult.metrics.SMR_completion.toFixed(2)}%
+                              </span>
+                            </div>
+                          )}
+                          {analysisResult.metrics.GPR_delay_days !== undefined && (
+                            <div className="flex justify-between">
+                              <span className="font-paragraph text-sm text-foreground">Отставание ГПР</span>
+                              <span className="font-paragraph text-sm font-medium text-deep-black">
+                                {analysisResult.metrics.GPR_delay_days} дней
+                              </span>
+                            </div>
+                          )}
+                          {(() => {
+                            const dduVal = analysisResult.metrics.DDU_payments_percent?.[0];
+                            return typeof dduVal === 'number' ? (
+                              <div className="flex justify-between">
+                                <span className="font-paragraph text-sm text-foreground">Платежи по ДДУ</span>
+                                <span className="font-paragraph text-sm font-medium text-deep-black">
+                                  {dduVal.toFixed(2)}%
+                                </span>
+                              </div>
+                            ) : null;
+                          })()}
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Reasoning */}
+                    {analysisResult.reasoning && analysisResult.reasoning.length > 0 && (
+                      <div>
+                        <h3 className="font-heading text-lg text-deep-black mb-3">Детали Анализа</h3>
+                        <div className="space-y-2 text-sm">
+                          {analysisResult.reasoning.map((reason, idx) => (
+                            <p key={idx} className="font-paragraph text-foreground">
+                              {reason}
+                            </p>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              ) : (
+                <div className="bg-white p-10 rounded-lg border border-light-grey">
+                  <div className="flex items-center gap-3 mb-8">
+                    <FileText className="w-6 h-6 text-primary" />
+                    <h2 className="font-heading text-3xl text-deep-black">
+                      Недавние Загрузки
+                    </h2>
+                  </div>
+
+                  {recentReports.length === 0 ? (
+                    <p className="font-paragraph text-base text-medium-grey text-center py-12">
+                      Отчёты ещё не проанализированы. Загружен те первый отчёт, чтобы начать.
+                    </p>
+                  ) : (
+                    <div className="space-y-4">
+                      {recentReports.map((report, index) => (
+                        <motion.button
+                          key={report._id}
+                          initial={{ opacity: 0, y: 10 }}
+                          animate={{ opacity: 1, y: 0 }}
+                          transition={{ duration: 0.3, delay: index * 0.1 }}
+                          onClick={() => {
+                            // Переходим на страницу проекта с информацией из отчета
+                            if (report.analysisResult) {
+                              // Сохраняем результат анализа в sessionStorage чтобы отобразить на странице проекта
+                              sessionStorage.setItem(`project-${report._id}`, JSON.stringify(report.analysisResult));
+                              window.location.href = `/projects/${report._id}`;
+                            }
+                          }}
+                          className="w-full text-left p-6 bg-background rounded-lg border border-light-grey hover:border-primary hover:shadow-lg transition-all cursor-pointer"
+                        >
+                          <div className="flex items-start justify-between mb-3">
+                            <h3 className="font-paragraph text-base text-deep-black max-w-[70%] break-words">
+                              {report.reportFileName}
+                            </h3>
+                            <span
+                              className={`font-paragraph text-xs px-3 py-1 rounded-full flex-shrink-0 ml-2 ${
+                                report.processingStatus === 'Completed'
+                                  ? 'bg-success-green text-success-green-foreground'
+                                  : report.processingStatus === 'Processing'
+                                  ? 'bg-primary text-primary-foreground'
+                                  : 'bg-light-grey text-foreground'
+                              }`}
+                            >
+                              {report.processingStatus}
+                            </span>
+                          </div>
+                          {report.uploadDate && (
+                            <p className="font-paragraph text-sm text-medium-grey mb-2">
+                              {format(new Date(report.uploadDate), 'MMMM d, yyyy • HH:mm')}
+                            </p>
+                          )}
+                          {report.ingestionLog && (
+                            <p className="font-paragraph text-sm text-foreground">
+                              {report.ingestionLog}
+                            </p>
+                          )}
+                        </motion.button>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
+            </motion.div>
+          </div>
+        </section>
+      </main>
+
+      <Footer />
+    </div>
+  );
+}
